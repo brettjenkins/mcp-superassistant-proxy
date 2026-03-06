@@ -1,4 +1,16 @@
-# MCP SuperAssistant Proxy
+# MCP SuperAssistant Proxy (brettjenkins fork)
+
+> **Fork of [leeroybrun/mcp-superassistant-proxy](https://github.com/leeroybrun/mcp-superassistant-proxy)**
+>
+> This fork makes two changes to the original:
+>
+> **1. Fix tool name dots** — The original uses `serverName.toolName` as the composite tool name (e.g. `github-brettjenkins.create_issue`). Many MCP clients, including claude.ai, only allow `[a-zA-Z0-9_-]` in tool names and reject dots. This fork replaces the dot separator with an underscore using a registry map for unambiguous reverse lookup on `tools/call`, so `github-brettjenkins.create_issue` becomes `github-brettjenkins_create_issue`.
+>
+> **2. Docker image** — A `Dockerfile` and GitHub Actions workflow are included to build and publish the image to GHCR (`ghcr.io/brettjenkins/mcp-superassistant-proxy`), making it easy to self-host as a Kubernetes deployment without relying on `npx` at runtime.
+>
+> A PR has been raised against the upstream repo. In the meantime this fork is used in production.
+
+---
 
 A **bulletproof proxy server** for MCP (Model Context Protocol) that aggregates multiple MCP servers with comprehensive memory leak prevention and reliable HTTP/SSE transport. Perfect for Chrome extensions and web applications.
 
