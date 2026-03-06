@@ -148,6 +148,10 @@ class MCPSuperAssistantProxy {
 
  // Cleanup state tracking
  private isShuttingDown: boolean = false;
+ // Registry mapping safe composite tool names (underscores) back to their
+ // original server/tool name pair. Populated when building tools/list responses,
+ // used for routing tools/call requests.
+ private toolNameRegistry: Map<string, {serverName: string, toolName: string}> = new Map();
 
  constructor(options: MCPSuperAssistantProxyOptions) {
    this.config = options.config;
@@ -581,6 +585,20 @@ class MCPSuperAssistantProxy {
    });
  }
 
+ // Builds a safe composite tool name for a server/tool pair and registers it
+ // for reverse lookup on tool calls. Replaces dots with underscores so the
+ // resulting name satisfies the MCP client regex ^[a-zA-Z0-9_-]{1,64}$.
+ private registerToolName(serverName: string, toolName: string): string {
+   const safe = `${serverName}.${toolName}`.replace(/\./g, '_');
+   this.toolNameRegistry.set(safe, {serverName, toolName});
+   return safe;
+ }
+
+ // Resolves a safe composite tool name back to its server/tool pair.
+ private resolveToolName(safeName: string): {serverName: string, toolName: string} | undefined {
+   return this.toolNameRegistry.get(safeName);
+ }
+
  private setupServerHandlers(): void {
    // Set up tool handlers
    this.server.setRequestHandler(ListToolsRequestSchema, async () => {
@@ -588,7 +606,7 @@ class MCPSuperAssistantProxy {
      for (const [serverName, server] of this.connectedServers) {
        for (const tool of server.tools) {
          allTools.push({
-           name: `${serverName}.${tool.name}`,
+           name: this.registerToolName(serverName, tool.name),
            description: `[${serverName}] ${tool.description || tool.name}`,
            inputSchema: tool.inputSchema
          });
@@ -685,7 +703,9 @@ class MCPSuperAssistantProxy {
      }
      
      // Handle delegated tool calls
-     const [serverName, toolName] = name.split('.', 2);
+     const resolved = this.resolveToolName(name);
+     const serverName = resolved?.serverName;
+     const toolName = resolved?.toolName;
      if (!serverName || !toolName) {
        return {
          content: [{
@@ -695,7 +715,7 @@ class MCPSuperAssistantProxy {
          isError: true
        };
      }
-     
+
      const server = this.connectedServers.get(serverName);
      if (!server) {
        return {
@@ -1060,7 +1080,7 @@ class MCPSuperAssistantProxy {
      for (const [serverName, server] of this.connectedServers) {
        for (const tool of server.tools) {
          allTools.push({
-           name: `${serverName}.${tool.name}`,
+           name: this.registerToolName(serverName, tool.name),
            description: `[${serverName}] ${tool.description || tool.name}`,
            inputSchema: tool.inputSchema
          });
@@ -1157,7 +1177,9 @@ class MCPSuperAssistantProxy {
      }
      
      // Handle delegated tool calls
-     const [serverName, toolName] = name.split('.', 2);
+     const resolved = this.resolveToolName(name);
+     const serverName = resolved?.serverName;
+     const toolName = resolved?.toolName;
      if (!serverName || !toolName) {
        return {
          content: [{
@@ -1167,7 +1189,7 @@ class MCPSuperAssistantProxy {
          isError: true
        };
      }
-     
+
      const server = this.connectedServers.get(serverName);
      if (!server) {
        return {
