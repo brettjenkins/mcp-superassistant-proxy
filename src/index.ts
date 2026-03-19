@@ -115,6 +115,7 @@ interface MCPSuperAssistantProxyOptions {
   timeout: number;
   heartbeatInterval: number;
   sessionTimeout: number;
+  keepaliveInterval: number; // ms between pings to stdio subprocesses, 0 = disabled
 }
 
 class MCPSuperAssistantProxy {
@@ -148,6 +149,7 @@ class MCPSuperAssistantProxy {
 
  // Cleanup state tracking
  private isShuttingDown: boolean = false;
+ private keepaliveTimer?: NodeJS.Timeout;
  // Registry mapping safe composite tool names (underscores) back to their
  // original server/tool name pair. Populated when building tools/list responses,
  // used for routing tools/call requests.
@@ -254,6 +256,52 @@ class MCPSuperAssistantProxy {
    this.createInterval(() => {
      this.cleanupDisconnectedServers();
    }, 5 * 60 * 1000);
+ }
+
+ /**
+  * Start periodic keepalive pings to all stdio subprocesses.
+  * This prevents MCP servers with inactivity timeouts (e.g. obsidian-mcp's
+  * ConnectionMonitor) from self-shutting-down between tool calls.
+  */
+ private startStdioKeepalive(): void {
+   const interval = this.options.keepaliveInterval;
+   if (interval <= 0) {
+     logger.info('Stdio keepalive pings disabled');
+     return;
+   }
+
+   logger.info(`Starting stdio keepalive pings every ${interval}ms`);
+
+   this.keepaliveTimer = this.createInterval(() => {
+     for (const [serverName, server] of this.connectedServers) {
+       // Only ping stdio subprocesses — remote servers have their own keepalive
+       if (server.config.type !== 'stdio') {
+         continue;
+       }
+
+       // Skip if the child process is already dead
+       if (server.childProcess && (server.childProcess.killed || server.childProcess.exitCode !== null)) {
+         logger.debug(`Skipping keepalive for ${serverName} — process already exited`);
+         continue;
+       }
+
+       // Fire-and-forget: send ping, log errors, never crash
+       server.client.ping({ timeout: 5000 }).then(() => {
+         logger.debug(`Keepalive ping OK: ${serverName}`);
+       }).catch((error) => {
+         const errorMsg = this.formatNetworkError(error);
+         logger.warn(`Keepalive ping failed for ${serverName}: ${errorMsg}`);
+       });
+     }
+   }, interval);
+ }
+
+ private stopStdioKeepalive(): void {
+   if (this.keepaliveTimer) {
+     this.clearTrackedInterval(this.keepaliveTimer);
+     this.keepaliveTimer = undefined;
+     logger.info('Stopped stdio keepalive pings');
+   }
  }
 
  private async safeAsyncOperation<T>(operation: () => Promise<T>, timeoutMs: number = 5000, description: string = 'operation'): Promise<T | null> {
@@ -1441,6 +1489,9 @@ class MCPSuperAssistantProxy {
    }
   
    console.log(`Successfully initialized mcpsuperassistantproxy with ${this.connectedServers.size} servers`);
+
+   // Start keepalive pings after all servers are connected
+   this.startStdioKeepalive();
  }
 
  private async connectToServer(serverName: string, config: MCPServerConfig): Promise<void> {
@@ -1707,6 +1758,9 @@ class MCPSuperAssistantProxy {
    // Set shutdown flag to prevent new operations
    this.isShuttingDown = true;
 
+   // Stop keepalive pings
+   this.stopStdioKeepalive();
+
    // Clear all intervals and timeouts first
    console.log("Clearing all intervals and timeouts...");
    this.intervals.forEach(intervalId => {
@@ -1875,6 +1929,11 @@ async function main() {
       default: false,
       description: 'Enable debug logging (same as --logLevel debug)'
     })
+    .option('keepaliveInterval', {
+      type: 'number',
+      default: 30000,
+      description: 'Interval in milliseconds between keepalive pings to stdio subprocesses (0 to disable)'
+    })
 
     .parseSync();
 
@@ -1892,6 +1951,9 @@ async function main() {
       timeout: argv.timeout,
       heartbeatInterval: DEFAULT_HEARTBEAT_INTERVAL,
       sessionTimeout: DEFAULT_SESSION_TIMEOUT,
+      keepaliveInterval: process.env.MCP_KEEPALIVE_INTERVAL_MS !== undefined
+        ? Number(process.env.MCP_KEEPALIVE_INTERVAL_MS)
+        : argv.keepaliveInterval,
     };
 
     // Create and initialize mcpsuperassistantproxy
