@@ -118,6 +118,52 @@ interface MCPSuperAssistantProxyOptions {
   keepaliveInterval: number; // ms between pings to stdio subprocesses, 0 = disabled
 }
 
+// FORK PATCH: per-session tool filtering via X-MCP-Tool-Allow / X-MCP-Tool-Deny headers
+interface ToolFilter {
+  allow?: string[];
+  deny?: string[];
+}
+
+interface CompiledToolFilter {
+  allow?: RegExp[];
+  deny?: RegExp[];
+}
+
+function parseFilterHeaders(headers: Record<string, string | string[] | undefined>): ToolFilter | undefined {
+  const parseList = (h: string | string[] | undefined): string[] | undefined => {
+    if (!h) return undefined;
+    const s = Array.isArray(h) ? h.join(',') : h;
+    const arr = s.split(',').map(x => x.trim()).filter(Boolean);
+    return arr.length ? arr : undefined;
+  };
+  const allow = parseList(headers['x-mcp-tool-allow']);
+  const deny = parseList(headers['x-mcp-tool-deny']);
+  if (!allow && !deny) return undefined;
+  return { allow, deny };
+}
+
+function globToRegex(pattern: string): RegExp {
+  const escaped = pattern.replace(/[.+?^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*');
+  return new RegExp(`^${escaped}$`);
+}
+
+function compileFilter(filter: ToolFilter): CompiledToolFilter {
+  return {
+    allow: filter.allow?.map(globToRegex),
+    deny: filter.deny?.map(globToRegex),
+  };
+}
+
+function isToolAllowed(toolName: string, compiled: CompiledToolFilter | null): boolean {
+  if (!compiled) return true;
+  if (compiled.deny?.some(re => re.test(toolName))) return false;
+  if (compiled.allow && compiled.allow.length > 0) {
+    return compiled.allow.some(re => re.test(toolName));
+  }
+  return true;
+}
+// END FORK PATCH
+
 class MCPSuperAssistantProxy {
  private connectedServers: Map<string, ConnectedServer> = new Map();
  private server: Server;
@@ -180,7 +226,7 @@ class MCPSuperAssistantProxy {
    this.app.use((req, res, next) => {
      res.setHeader('Access-Control-Allow-Origin', '*');
      res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
-     res.setHeader('Access-Control-Allow-Headers', 'Content-Type, mcp-session-id, Cache-Control');
+     res.setHeader('Access-Control-Allow-Headers', 'Content-Type, mcp-session-id, Cache-Control, X-MCP-Tool-Allow, X-MCP-Tool-Deny');
      res.setHeader('Access-Control-Expose-Headers', 'mcp-session-id, Content-Type');
      
      // Handle preflight requests
@@ -368,8 +414,13 @@ class MCPSuperAssistantProxy {
            }
          });
 
-         // Copy all handlers from main server to session server
-         this.copyServerHandlers(sessionServer);
+         // FORK PATCH: parse per-session tool filter from headers
+         const filter = parseFilterHeaders(req.headers);
+         if (filter && this.options.logLevel === 'debug') {
+           console.log(`Session filter: allow=${filter.allow?.join(',') || '(any)'} deny=${filter.deny?.join(',') || '(none)'}`);
+         }
+         // Copy all handlers from main server to session server (with optional filter)
+         this.copyServerHandlers(sessionServer, filter);
 
          transport = new StreamableHTTPServerTransport({
            sessionIdGenerator: () => randomUUID(),
@@ -1118,49 +1169,58 @@ class MCPSuperAssistantProxy {
 
 
 
- public copyServerHandlers(sseServer: Server): void {
+ public copyServerHandlers(sseServer: Server, filter?: ToolFilter): void {
    // Copy all the request handlers from the main server to the SSE server
    // This ensures SSE clients get the same functionality
-   
+   // FORK PATCH: optional filter applies to tools/list and tools/call
+   const compiledFilter: CompiledToolFilter | null = filter ? compileFilter(filter) : null;
+   const passes = (toolName: string) => isToolAllowed(toolName, compiledFilter);
+
    // Set up tool handlers
    sseServer.setRequestHandler(ListToolsRequestSchema, async () => {
      const allTools = [];
      for (const [serverName, server] of this.connectedServers) {
        for (const tool of server.tools) {
+         const composite = this.registerToolName(serverName, tool.name);
+         if (!passes(composite)) continue;
          allTools.push({
-           name: this.registerToolName(serverName, tool.name),
+           name: composite,
            description: `[${serverName}] ${tool.description || tool.name}`,
            inputSchema: tool.inputSchema
          });
        }
      }
-     
-     // Add management tools
-     allTools.push({
-       name: "list_servers",
-       description: "List all connected MCP servers and their capabilities",
-       inputSchema: {
-         type: "object",
-         properties: {},
-         additionalProperties: false
-       }
-     });
-     
-     allTools.push({
-       name: "get_server_info", 
-       description: "Get detailed information about a specific server",
-       inputSchema: {
-         type: "object",
-         properties: {
-           serverName: {
-             type: "string",
-             description: "Name of the server to get info for"
-           }
-         },
-         required: ["serverName"],
-         additionalProperties: false
-       }
-     });
+
+     // Add management tools (also filtered)
+     if (passes("list_servers")) {
+       allTools.push({
+         name: "list_servers",
+         description: "List all connected MCP servers and their capabilities",
+         inputSchema: {
+           type: "object",
+           properties: {},
+           additionalProperties: false
+         }
+       });
+     }
+
+     if (passes("get_server_info")) {
+       allTools.push({
+         name: "get_server_info",
+         description: "Get detailed information about a specific server",
+         inputSchema: {
+           type: "object",
+           properties: {
+             serverName: {
+               type: "string",
+               description: "Name of the server to get info for"
+             }
+           },
+           required: ["serverName"],
+           additionalProperties: false
+         }
+       });
+     }
 
      return { tools: allTools };
    });
@@ -1168,7 +1228,18 @@ class MCPSuperAssistantProxy {
    // Set up tool call handler
    sseServer.setRequestHandler(CallToolRequestSchema, async (request) => {
      const { name, arguments: args } = request.params;
-     
+
+     // FORK PATCH: defence in depth — reject filtered-out tools
+     if (!passes(name)) {
+       return {
+         content: [{
+           type: "text",
+           text: `Tool '${name}' is not available on this session (filtered out by X-MCP-Tool-Allow/Deny headers)`
+         }],
+         isError: true
+       };
+     }
+
      if (name === "list_servers") {
        const serverInfo = Array.from(this.connectedServers.entries()).map(([name, server]) => ({
          name,
